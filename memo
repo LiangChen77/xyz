@@ -1,0 +1,969 @@
+************
+launch a kvm guest from command line
+************
+
+sudo ip tuntap add dev mytap mode tap
+sudo ifconfig mytap up
+sudo ovs-vsctl add-port br-phy mytap
+sudo iptables -t nat -A POSTROUTING -o br-eth0 -j MASQUERADE
+sudo iptables -F # some filter rules in default centos install block dns requests.
+
+sudo qemu-system-x86_64 -enable-kvm -hda cirros-0.3.2-x86_64-blank.img -kernel cirros-0.3.2-x86_64-vmlinuz -initrd cirros-0.3.2-x86_64-initrd  -boot d -m 2048 -net nic -net tap,ifname=mytap,script=no
+
+#vm static nic
+TYPE=Ethernet
+BOOTPROTO=static
+IPADDR=192.168.133.10
+NETMASK=255.255.255.0
+BROADCAST=192.168.133.255
+NETWORK=192.168.133.0
+GATEWAY=192.168.133.1
+DEFROUTE=yes
+PEERDNS=yes
+PEERROUTES=yes
+IPV4_FAILURE_FATAL=no
+NAME=eth0
+UUID=e49878b2-875b-466a-9220-e27c92b208f2
+DEVICE=eth0
+ONBOOT=yes
+DNS1=202.106.46.151
+DOMAIN=localdomain
+
+#passing numa node
+nc -ln 4949
+./x86_64-softmmu/qemu-system-x86_64 -enable-kvm -m 2048M -object memory-backend-ram,size=1024M,policy=bind,host-nodes=0,id=ram-node0 -numa node,nodeid=0,cpus=0-1,memdev=ram-node0 -object memory-backend-ram,size=1024M,policy=bind,host-nodes=1,id=ram-node1 -numa node,nodeid=1,cpus=2-3,memdev=ram-node1  -drive if=none,id=drive0,file=../trusty-server-cloudimg-amd64-disk1.img -device virtio-blk-pci,drive=drive0,scsi=off -nographic
+
+#attach numa nodes onto different pxb
+./x86_64-softmmu/qemu-system-x86_64 -enable-kvm -m 2048M -smp 4 -object memory-backend-ram,size=1024M,policy=bind,prealloc=on,host-nodes=0,id=ram-node0 -numa node,nodeid=0,cpus=0-1,memdev=ram-node0 -object memory-backend-ram,size=1024M,policy=bind,prealloc=on,host-nodes=1,id=ram-node1 -numa node,nodeid=1,cpus=2-3,memdev=ram-node1 -device pxb,id=bridge1,bus=pci.0,numa_node=1,bus_nr=4 -device pxb,id=bridge2,bus=pci.0,numa_node=0,bus_nr=8 -device pxb,id=bridge3,bus=pci.0,bus_nr=16,bus=pci.0 -drive if=none,id=drive0,file=../trusty-server-cloudimg-amd64-disk1.img -device virtio-blk-pci,drive=drive0,scsi=off,bus=bridge3,addr=1 -monitor tcp:127.0.0.1:4949 -nographic
+
+#enable virtio-net multiqueue
+/usr/bin/qemu-system-x86_64 -enable-kvm -m 2048 -drive if=none,id=drive0,file=trusty-server-cloudimg-amd64-disk1.img -device virtio-blk-pci,drive=drive0,scsi=off -netdev type=tap,ifname=mytap,id=net0,script=no,vhost=on -device virtio-net-pci,netdev=net0  -monitor tcp:127.0.0.1:4555
+
+#With tap device:
+
+-netdev type=tap,ifname=newtap,id=net0,script=no,vhost=on,queues=4 -device virtio-net-pci,netdev=net0,mq=on,vectors=9
+
+#newtap is the tap device name to set up; 
+#queues=4 tells it to support 4 queues
+#mq=on is to enable multiqueue for the virtio-net device
+#vectors=9 specifies 9 msix interrupt vectors (4 for tx queues, 4 for rx queues, 1 for config, and one for control vq) for the MSI-X Table and PBA
+
+#With macvtap device:
+ip link add link eth0 name macvtap0 type macvtap mode bridge
+ip link set macvtap0 address <MAC> up
+ll /dev/tap*
+crw-------. 1 root root 247, 1 Sep  9 22:33 /dev/tapXXX
+
+-netdev tap,id=hostnet0,vhost=on,fds=4:5:6:7 4<>/dev/tapXXX 5<>/dev/tapXXX 6<>/dev/tapXXX 7<>/dev/tapXXX -device virtio-net-pci,mq=on,vectors=9,netdev=hostnet0,mac=<MAC>,id=net0
+
+#setup a tmp image
+mount -o size=2G -t tmpfs none virt_server/
+qemu-img create -f qcow2 vdd.qcow2 1G
+
+**********
+gdb
+**********
+
+#loaded symbol tables
+maintenance info symtabs
+
+!!! dpkg -i XXX   # XXX can be installed even a newer package exists, and causing problem.  only use in testing env, e.g. a container for loading core dump
+
+#extract deb-dbg package and cp shared libraries to a location for gdb to load (not completely working)
+dpkg -x libc6-dbg_2.15-0ubuntu10.5_amd64.deb /tmp/out
+
+#Specifies directories where GDB will search for shared libraries with symbols
+#for non absult path libs only
+set solib-search-path [Directories]
+show solib-search-path
+
+# load core dump with debug symbol
+gdb --symbols=/usr/lib/debug/usr/sbin/libvirtd /path/to/regular/libvirtd core
+
+#if it shows the "*" which means it couldn't find debug info
+info sharedlibrary
+
+# add source path
+set directories path-list 
+set directories '/root/multipath-tools-0.4.9:/root/multipath-tools-0.4.9/multipathd:/root/multipath-tools-0.4.9/libmultipath'
+
+!!! stack frames can be optimized out, gdb cannot extract the stack trace without debug symbols
+
+   52  readelf -h iscsid
+   53  readelf -l  iscsid
+   54  readelf -a iscsid
+   55  history | grep elf
+   56  readelf  --debug-dump iscsid
+   57  history | grep elf
+objdump -h iscsid
+objdump --dwarf=info iscsid
+
+
+**********
+crash dump (apport)
+**********
+
+#unpack and load the core dump with gdb. loading the current system's debug symbol shared libraries (-dbg packages)
+apport-retrace --confirm --gdb --verbose --output libvirt_analys.crash _usr_sbin_libvirtd.0.crash
+
+#unpack and load the core dump with gdb. creating an sandbox and downloading debug symbol shared libraries according to the current system's apt sources
+apport-retrace --confirm --gdb --sandbox system --verbose --output libvirt_analys.crash _usr_sbin_libvirtd.0.crash
+
+#unpack and load the core dump with gdb. loading the current system's debug symbol shared libraries (-dbg packages)
+apport-retrace --confirm --gdb --verbose --output libvirt_analys.crash _usr_sbin_libvirtd.0.crash
+
+#unpack the crash file to the target folder, so the core dump can be directly loaded by gdb
+apport-unpack <crash file> <target>
+
+1. crash dump with dependency information 
+apport-cli <name of the dump> 
+choose E to examine locally 
+chooos C to exit 
+
+The crash dump should have dependency information in it now. Make a copy of it e.g. XXX.with_dep 
+
+2. crash dump with symbolic stack trace 
+apport-cli <name of the dump> 
+choose E to examine locally 
+choose 3 to update the crash with fully symbolic stack trace 
+
+**********
+debug qemu
+**********
+./configure --enable-debug --target-list=x86_64-softmmu && make
+
+gdb qemu-system-x86_64
+r -enable-kvm -drive file=../../images/cirros-0.3.2-x86_64-blank.img,if=virtio -kernel ../../images/cirros-0.3.2-x86_64-vmlinuz -initrd ../../images/cirros-0.3.2-x86_64-initrd  -boot d -m 2048  -net nic -net tap,ifname=mytap,script=no  -monitor tcp:127.0.0.1:4555
+
+r -enable-kvm -drive file=../../images/cirros-0.3.2-x86_64-blank.img,if=virtio -kernel ../../images/cirros-0.3.2-x86_64-vmlinuz -initrd ../../images/cirros-0.3.2-x86_64-initrd  -boot d -m 2048   -netdev type=tap,ifname=mytap,id=net0,script=no,vhost=on -device virtio-net-pci,netdev=net0  -monitor tcp:127.0.0.1:4555
+
+
+start qemu with -s
+sudo qemu-system-x86_64 -s -enable-kvm -hda cirros-0.3.2-x86_64-blank.img -kernel cirros-0.3.2-x86_64-vmlinuz -initrd cirros-0.3.2-x86_64-initrd  -boot d -m 2048 -net nic -net tap,ifname=mytap,script=no
+
+qemu-system-x86_64 -netdev type=tap,id=guest0,script=kvm-ifup,vhost=on -device virtio-net-pci,netdev=guest0
+
+in gdb,
+target remote 127.0.0.1:1234
+set arch i386:x86-64
+
+#qemu unittest. refer to make check-help
+make check
+
+#mount qcow2
+guestmount -a ubuntu-14.04-server-cloudimg-amd64-disk1.img -m /dev/sdx1 /mnt
+
+#setup password for guest image
+virt-sysprep  --root-password password:123456  --password joe:file:/tmp/secret -a guest.img
+
+#savevm
+nc -l 4555
+sudo qemu-system-x86_64 -m 2048 -enable-kvm -drive if=none,id=drive0,file=trusty-server-cloudimg-amd64-disk1.img -device virtio-blk-pci,drive=drive0,scsi=off -nographic -monitor tcp:127.0.0.1:4555
+savevm mytestvm (to be issued from the qemu monitor session)
+
+#loadvm
+sudo qemu-system-x86_64 -m 2048 -enable-kvm -drive if=none,id=drive0,file=trusty-server-cloudimg-amd64-disk1.img -device virtio-blk-pci,drive=drive0,scsi=off -nographic -monitor tcp:127.0.0.1:4555 -loadvm mytestvm
+
+#live migration
+<qemu-command-line> -incoming tcp:0:4444 (or other PORT))
+
+(qemu) migrate -d tcp:B:4444 (or other PORT)
+(qemu) info migrate                   
+
+#exam guest physical memory
+(qemu) xp /xg <address>
+#To dump 8 bytes data at a given location.
+sudo virsh qemu-monitor-command <libvirt_instance_name> --hmp xp /xg <guest_physical_address>
+#exam block devices
+virsh qemu-monitor-command instance-00000001 --hmp info block
+
+#virtio 1.0
+add disable-legacy/disable-modern flag to virtio_pci_properties
+r -m 2048 -enable-kvm -drive if=none,id=drive0,file=../../images/xenial-server-cloudimg-amd64-disk1.img -device virtio-blk-pci,drive=drive0,scsi=off -netdev type=tap,id=guest0,script=no,ifname=mytap -device virtio-net-pci,netdev=guest0,disable-legacy=on,disable-modern=off
+#all property definitions by the following code snippet can be specified in cmd, like mq=on
+#static Property virtio_net_properties ... DEFINE_PROP_BIT()
+
+
+#vhost-user testing with vapp
+#download and compile vapp and run the server
+vapp#  ./vhost -s ./vhost.sock
+qemu-system-x86_64 -m 2048 -enable-kvm -drive if=none,id=drive0,file=trusty-server-cloudimg-amd64-disk1.img -device virtio-blk-pci,drive=drive0,scsi=off -nographic -mem-path /hugetlbfs,prealloc=on,share=on -netdev type=vhost-user,id=net0,chardev=char1 -device virtio-net-pci,netdev=net0 -chardev socket,id=char1,path=../vapp/vhost.sock
+
+
+#turn on trace
+1. Build with the 'simple' trace backend:
+    ./configure --trace-backend=simple && make
+    ./configure --enable-debug --target-list=x86_64-softmmu --enable-trace-backend=stderr && make
+2. Create a file with the events you want to trace:
+   echo bdrv_aio_readv   > /tmp/events
+   echo bdrv_aio_writev >> /tmp/events
+3. Run the virtual machine to produce a trace file:
+    qemu -trace events=/tmp/events ... # your normal QEMU invocation
+4. Pretty-print the binary trace file:
+    ./simpletrace.py trace-events trace-*
+
+# qemu monitor calles in libvirt log
+cmd: search qemuMonitorIOWrite
+return: search qemuMonitorIOProcess
+
+
+********
+PCI
+********
+
+lspci -vv
+#check a pci device's config space
+od -Ax -tx4 /sys/devices/pci0000:00/0000:00:03.0/config
+
+
+**********
+run kvm tests
+**********
+Grab the tests from
+git://git.kernel.org/pub/scm/virt/kvm/kvm-unit-tests.git
+
+and run them with
+
+    ./configure
+    make
+    ./x86-run x86/kvmclock_test.flat  --append "10000000 `date +%s`"
+
+********
+run virt tests
+********
+git clone git://github.com/autotest/virt-test.git
+install dependency: http://virt-test.readthedocs.org/en/latest/basic/GetStarted.html
+
+./run -t qemu --bootstrap
+./run -t qemu
+./run -t libvirt
+
+********
+git sent patch
+********
+
+single patch:
+git format-patch -v 2 HEAD^..HEAD -o ../patches/count_tlb_flush -s
+git send-email --to pbonzini@redhat.com --cc kvm@vger.kernel.org --cc rkrcmar@redhat.com ../patches/count_tlb_flush/v2-0001-KVM-x86-count-actual-tlb-flushes.patch
+git send-email --to n-horiguchi@ah.jp.nec.com --to linux-mm@kvack.org  -cc riel@redhat.com -cc mgorman@suse.de --cc akpm@linux-foundation.org --cc linux-kernel@vger.kernel.org /tmp/skip_non_migratable_vma/
+
+patch series:
+git format-patch -v 3 -2 -s --cover-letter -o ../patches/count_tlb_flush/series1/
+git send-email --to liangchen.linix@gmail.com  ../patches/count_tlb_flush/series1/
+
+ubuntu patch:
+git send-email --to liang.chen@canonical.com --from liang.chen@canonical.com --smtp-server /usr/bin/msmtp --suppress-cc=all --in-reply-to CAPXWB9LcMDKp2QEPeEUXQuUh7wRk8+=KJ4weiQRtGLgHFz9tEA@mail.gmail.com --compose  /home/lchen/workspace/salesforce/94905/patches/trusty/0001-SRU-Trusty-KVM-x86-move-steal-time-initialization-to.patch
+
+********
+grub cli boot
+********
+
+ls/ls (hd0,6)
+set prefix=(hdX,Y)/boot/grub
+set root=(hdX,Y)
+linux (hdX,Y)/boot/vmlinuz-3.0.2-14 root=/dev/sda1 ro
+initrd (hdX,Y)/boot/initrd.img-3.0.2-14
+boot
+
+
+********
+openstack
+********
+
+uploading aki image to glance
+glance image-create --name "cirros-threepart-kernel" \
+  --disk-format aki --container-format aki --is-public False \
+  --file /home/lchen/workspace/devstack/files/images/cirros-0.3.2-x86_64-uec/cirros-0.3.1~pre4-x86_64-vmlinuz
+glance image-create --name "cirros-threepart-ramdisk" \
+  --disk-format ari --container-format ari --is-public False \
+  --file /home/lchen/workspace/devstack/files/images/cirros-0.3.2-x86_64-uec
+glance image-create --name "cirros-threepart" --disk-format ami \
+  --container-format ami --is-public False \
+  --property kernel_id=6fa9c5d0-2efe-4e33-bff2-da8bea4c69ad ramdisk_id=c0034e8f-fb66-4d12-b15b-e11223ec6abf \
+  --file /home/lchen/workspace/devstack/files/images/cirros-0.3.2-x86_64-uec
+
+nova keypair-add --pub-key ~/.ssh/id_rsa.pub mykey
+
+neutron net-create --provider:physical_network=physnet1 --provider:network_type=flat --shared my_flat
+neutron net-create --provider:physical_network=physnet1 --provider:network_type=flat --shared my_flat ext_net --router:external=True 
+
+neutron subnet-create my_flat 10.0.5.0/24 --name my_flat_subnet --gateway 192.168.0.1 --dns-nameservers list=true 8.8.8.7 8.8.8.8
+neutron subnet-create MY_FLAT_NET 192.168.0.0/24 --name MY_FLAT_SUBNET --no-gateway --host-route destination=0.0.0.0/0,nexthop=192.168.0.1 --allocation-pool start=192.168.0.230,end=192.168.0.234 --dns-nameservers list=true 8.8.8.7 8.8.8.8
+neutron subnet-list
+neutron subnet-create --allocation-pool start=192.168.100.102,end=192.168.100.126 --gateway 192.168.100.1 ext_net 192.168.100.100/24 --enable_dhcp=False
+
+neutron net-create Public_Network --router:external=True
+neutron subnet-create --name Public_Subnet --allocation-pool start=10.5.0.210,end=10.5.0.219 Public_Network 10.5.0.0/16
+neutron net-create Private_Net10 && neutron subnet-create --name Private_Net10_Subnet Private_Net10 10.10.10.0/24 --dns-nameservers list=true 8.8.8.7 8.8.8.8
+neutron router-create os-router-1
+neutron router-interface-add os-router-1 Private_Net10_Subnet
+neutron router-gateway-set os-router-1 Public_Network
+neutron security-group-rule-create --protocol icmp --direction ingress default && neutron security-group-rule-create --protocol tcp --port-range-min 22 --port-range-max 22 --direction ingress default
+
+nova floating-ip-pool-list
+nova floating-ip-create Public_Network
+nova add-floating-ip myinst3 10.5.0.211
+
+nova boot --image cirros-0.3.2-x86_64-uec --flavor m1.tiny --nic net-id=1065aaf7-795c-4fed-a326-df28cf196b28 --key-name mykey my2
+nova get-vnc-console my2 novnc
+sudo virsh dumpxml 2
+neutron security-group-show 3a2fe279-ff39-496f-aa63-44985197bca5
+neutron --os-tenant-name admin --os-username admin security-group-rule-create --protocol icmp --direction ingress 3a2fe279-ff39-496f-aa63-44985197bca5
+neutron --os-tenant-name admin --os-username admin security-group-rule-create --protocol icmp --direction egress 3a2fe279-ff39-496f-aa63-44985197bca5
+
+create a bootable volume while booting
+nova boot --flavor m1.small --block-device source=image,id=7896eb6d-9afd-4db5-b594-aac9f92586ec,dest=volume,size=5,shutdown=preserve,bootindex=0 --key-name mykey --nic net-id=0650a621-a766-4212-9341-5412eb68347c myInstanceFromVolume 
+
+#create a bootable volume
+cinder create 4 --display-name my-2nd-volume --image-id d5604680-21b9-480c-b4dd-a9bf83465c74
+
+boot from a bootable volume
+nova boot --flavor m1.small --block-device source=volume,id=2fd21caa-e1e8-4f64-bf78-f97a3df27ef4,dest=volume,size=5,shutdown=preserve,bootindex=0 --key-name mykey --nic net-id=0650a621-a766-4212-9341-5412eb68347c myInstanceFromVolume2
+
+********
+openstack testing
+********
+
+#run a selected nova unit test with debug enabled
+./run_tests.sh -d -N nova.tests.virt.libvirt.test_driver.LibvirtConnTestCase.test_private_destroy_ebusy_timeout
+python -m unittest -v novaclient.tests.v1_1.test_shell.ShellTest.test_boot_files
+
+********
+/etc/network/interfaces
+********
+# interfaces(5) file used by ifup(8) and ifdown(8)
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+  address 0.0.0.0
+  up ifconfig $IFACE 0.0.0.0 up
+  up ip link set $IFACE promisc on
+  down ip link set $IFACE promisc off
+  down ifconfig $IFACE down
+
+auto br-eth0
+iface br-eth0 inet static
+  address 192.168.0.13
+  netmask 255.255.255.0
+  gateway 192.168.0.1
+  dns-nameservers 8.8.8.8
+  up ip link set $IFACE promisc on
+  down ip link set $IFACE promisc off
+
+
+**********
+vpn client
+**********
+sudo openvpn --config /etc/openvpn/ctslab-vpn.config
+
+sudo openconnect --no-cert-check a7.blockcn.net -u cl55_6
+efd7eea92
+
+*********
+LXC
+********
+sudo lxc-create --template ubuntu --name ubuntu_trusty -- --release trusty
+sudo lxc-start --name ubuntu_trusty
+sudo lxc-ls --fancy
+sudo lxc-stop --name ubuntu_trusty
+sudo lxc-destroy --name ubuntu_trusty
+
+sudo iptables -t nat -A POSTROUTING -o br-eth0 -j MASQUERADE
+
+
+**********
+network utils
+**********
+
+tcpdump -vvv "icmp or arp" -n -i qg-d3464911-de
+dump rabbit_mq payload:
+tcpdump tcp dst port 5672 -vvXn -i eth0 -w mq_dump
+dump dhcp:
+sudo tcpdump  -vv -i eth0 port 67 or port 68 -e -n
+sudo tcpdump -vvv "(src 10.230.56.11 or dst 10.230.56.11) and icmp" -n -i eth0
+ip link add veth-br-ex type veth peer name veth-eth0
+ip netns exec qrouter-abda5bd6-61e4-459a-8656-f87c7f3ed9d0 iptables -L
+
+openvswith patch port:
+sudo ovs-vsctl add-port br-eth0 veth-br-eth0
+sudo ovs-vsctl set interface veth-br-eth0 type=patch
+sudo ovs-vsctl add-port br-ex veth-br-ex
+sudo ovs-vsctl set interface veth-br-ex type=patch
+sudo ovs-vsctl set interface veth-br-eth0 option:peer=veth-br-ex
+sudo ovs-vsctl set interface veth-br-ex option:peer=veth-br-eth0
+
+//show per port network traffic (cum/peak/instant)
+iptop
+
+
+********
+VPN Customize
+********
+
+echo "200 outwall" >> /etc/iproute2/rt_tables
+
+# vi /etc/rc.local
+ipset create outwall hash:ip
+#vim /etc/dnsmasq.conf
+server=/facebook.com/8.8.8.8
+ipset=/facebook.com/outwall
+
+iptables -t mangle -A OUTPUT -d 8.8.8.8 -j MARK --set-mark 8
+iptables -t mangle -A PREROUTING -d 8.8.8.8 -j MARK --set-mark 8
+iptables -t mangle -A PREROUTING -m set --match-set outwall dst -j MARK --set-mark 8
+iptables -t mangle -A OUTPUT -m set --match-set outwall dst -j MARK --set-mark 8
+ip route add default via 192.168.*.* dev tun0 table outwall
+ip rule add fwmark 8 table outwall
+
+ipset list
+ip rule list
+ip route list table outwall
+iptables -t mangle -A PREROUTING -d 74.125.239.35 -j MARK --set-mark 8
+iptables -t mangle -A OUTPUT -d 74.125.239.35 -j MARK --set-mark 8
+
+
+********
+IRC
+********
+/server <znc_server_ip> 5000 liang:<pass>
+http://<znc_server_ip>:5000/
+/me doing something
+/nick new_nick
+
+
+********
+tar
+********
+# create archives
+$ tar cz my_large_file_1 my_large_file_2 | split -b 1024MiB - myfiles_split.tgz_
+# uncompress
+$ cat myfiles_split.tgz_* | tar xz
+
+
+********
+bzr
+********
+
+bzr commit --fixes=lp:1391313
+bzr push lp:~cbjchen/charms/trusty/nova-compute/lp1391313
+bzr uncommit
+bzr push --overwrite lp:~cbjchen/charms/precise/openstack-dashboard/lp1391313
+bzr uncommit -r -3
+bzr revert
+
+bzr diff -r-2 #changes of the last commit
+
+#pull from push branch
+bzr pull :push
+
+********
+shell
+********
+for ip in $(find . -name ip_addr); do echo $ip && grep bond $ip; done 
+for i in 1 2 3; do grep -rIn a9056ba3-6dac-4366-a6de-d3489963154f log-swift-proxy$i/var/log; done
+for (( i = 0 ; i < ${#names[@]} ; i++ )) do
+for (( c=1; c<=5; c++ ))
+nova list | awk  -F'[|=]' '/juju-trusty/ { print $8 $3 }
+for i in {0..24}; do juju ssh $i 'sudo apt-add-repository -y ppa:billy-olsen/testfix && sudo apt-get update'; done
+
+
+********
+apt
+********
+#add personal repo from https://launchpad.net/~hopem/+archive/ubuntu/icehouse-hotfix-staging/:
+
+sudo add-apt-repository ppa:hopem/icehouse-hotfix-staging
+sudo apt-get update
+sudo apt-cache policy openstack-dashboard
+sudo apt-get install ...
+
+# specify openstack origin
+openstack-origin: "deb https://<user>:<pass>@private-ppa.launchpad.net/<project>/<ppa-name>/ubuntu trusty main|<gpg-pub-key-id>"
+
+# ddeb packages repository
+echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse
+    deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse
+    deb http://ddebs.ubuntu.com $(lsb_release -cs)-security main restricted universe multiverse
+    deb http://ddebs.ubuntu.com $(lsb_release -cs)-proposed main restricted universe multiverse" |     sudo tee -a /etc/apt/sources.list.d/ddebs.list
+sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 428D7C01
+sudo apt-get update
+
+********
+ppa
+********
+#install tools
+sudo apt-get install devscripts build-essential
+sudo apt-get install sbuild debhelper ubuntu-dev-tools
+
+#get package from official repo
+rmadison <package, e.g. python-novaclient>
+pull-lp-source <package> <release, e.g.precise>
+apt-get build-dep <package>
+
+#if the package is from a ppa
+apt-get source <package>
+
+#source repo configuration is usually the same location, i.e. s/deb/deb-src
+deb http://archive.ubuntu.com/ubuntu precise main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu precise-updates main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu precise-security main restricted universe multiverse
+
+deb-src http://archive.ubuntu.com/ubuntu precise main restricted universe multiverse
+deb-src http://archive.ubuntu.com/ubuntu precise-updates main restricted universe multiverse
+deb-src http://security.ubuntu.com/ubuntu precise-security main restricted universe multiverse
+
+#once the source is retrieved, apply patch using quilt
+- format the patch by git format-patch
+- copy the patch to <package root>/debian/patches
+- quilt new <patch name>, sometimes it needs to quilt pop and quilt push again
+
+#add change log
+#NEW_VERSION=${PKG_VERSION}hf${LP_BUG_ID}v`eval date +%Y%m%d`.${HF_BUILD_NUM}
+#CHANGELOG=( "HOTFIX|BACKPORT|SRU"
+#            " - ESCALATION: #$LP_BUG_ID"
+#            " - ..." )
+#refer to https://bazaar.launchpad.net/~cts-engineering/cts-engineering/tools/view/head%3A/packaging/template
+# or use the below script
+#!/bin/bash -eu
+#(($# >= 2)) || { echo "USAGE: `basename $0` <pkg_ver> <lp_bug> [<build_id>]"; exit 1; }
+#pkg_ver=$1
+#lp_bug=$2
+#build_id="${3:-0}"
+#echo ${pkg_ver}hf${lp_bug}v`eval date +%Y%m%d`.$build_id
+
+
+dch -i  #can be changed later by dch -e
+
+#build source and binary package
+debuild -S -k<your key here>
+debuild -S -k27D39DBA
+debuild -b -k<your key here>
+
+#build unsigned source
+debuild -i -us -uc -S
+
+#build unsigned binary
+debuild -i -us -uc -b
+
+#upload to ppa
+export DEBEMAIL=<email, e.g. "liang.chen@canonical.com">
+export DEBFULLNAME=<name, e.g. "Liang Chen">
+dput -f ppa:cbjchen/ppa python-novaclient_2.17.0-0ubuntu1~cloud0ubuntu1hf1408088v150113.0_source.changes
+
+search ubuntu-cloud-archive for ppa depedencies
+
+<dosaboy> liang: the steps are;
+<dosaboy> 1. add ubuntu series
+<dosaboy> 2. add ubuntu cloud archive series if necessary
+<dosaboy> set template etc in description
+<dosaboy> attach debdiff
+<dosaboy> and/or merge proposal  against ubuntu-server-dev branch
+<dosaboy> then subscribe ubuntu sponsors
+<dosaboy> team
+<dosaboy> add tags sts sts-sru
+<dosaboy> and ping people to get it moving ;)
+
+********
+mysql
+********
+
+all foreign keys on table <...>:
+select * from INFORMATION_SCHEMA.TABLE_CONSTRAINTS where CONSTRAINT_TYPE = 'FOREIGN KEY' and TABLE_NAME = 'ml2_network_segments';
+
+SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS where constraint_name = 'ml2_network_segments_ibfk_1';
+
+
+table charset:
+SELECT CCSA.character_set_name FROM information_schema.`TABLES` T,
+       information_schema.`COLLATION_CHARACTER_SET_APPLICABILITY` CCSA
+WHERE CCSA.collation_name = T.table_collation
+  AND T.table_schema = "neutron"
+  AND T.table_name = "ml2_network_segments";
+
+colume charset:
+SELECT character_set_name FROM information_schema.`COLUMNS` C
+WHERE table_schema = "neutron"
+  AND table_name = "networks"
+  AND column_name = "id";
+
+default charset:
+SHOW VARIABLES LIKE "character\_set\_database";
+
+#restore when available nodes are less than required
+<Mmike> and then I did 'juju resolved'
+<Mmike> so: 1) stop mysql on running node, 2) /etc/init.d/mysql boostrap-pxc, 3) juju add-unit (so that there is 3 of them in total), 4) juju resolved --retry (against all broken units)
+
+
+*********
+JUJU cheat sheet
+*********
+#deploy a specific version(20) of percona-cluster charm
+juju deploy --config local.yaml -n 3 cs:trusty/percona-cluster-12  mysql
+juju status --format=tabular
+juju run --all 'echo Acquire::HTTP::Proxy::private-ppa.launchpad.net
+"DIRECT"\; | sudo tee /etc/apt/apt.conf.d/02proxy'
+
+
+********
+Corosync & Pacemaker
+********
+#Printing ring status - corosync
+corosync-cfgtool -s
+#check the membership - corosync
+corosync-cmapctl  | grep members
+#check resource stat - pacemaker
+sudo crm_mon -1
+#edit resource configuration - pacemaker
+crm configure edit
+
+********
+Openssl
+********
+
+
+#Generate a new private key and Certificate Signing Request
+openssl req -out CSR.csr -new -newkey rsa:2048 -nodes -keyout privateKey.key
+
+#Generate a self-signed certificate (see How to Create and Install an Apache Self Signed Certificate for more info)
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout privateKey.key -out certificate.crt
+
+#Generate a certificate signing request (CSR) for an existing private key
+openssl req -out CSR.csr -key privateKey.key -new
+
+#Generate a certificate signing request based on an existing certificate
+openssl x509 -x509toreq -in certificate.crt -out CSR.csr -signkey privateKey.key
+
+#Remove a passphrase from a private key
+openssl rsa -in privateKey.pem -out newPrivateKey.pem
+
+#Check a Certificate Signing Request (CSR)
+openssl req -text -noout -verify -in CSR.csr
+
+#Check a private key
+openssl rsa -in privateKey.key -check
+
+#Check a certificate
+openssl x509 -in certificate.crt -text -noout
+
+#Check a PKCS#12 file (.pfx or .p12)
+openssl pkcs12 -info -in keyStore.p12
+
+#Check SSL cert
+openssl s_client -connect site:port
+
+
+********
+Rabbitmq
+********
+
+#enable management plugin
+rabbitmq-plugins enable rabbitmq_management
+service rabbitmq-server restart
+
+#give guest permission
+sudo rabbitmqctl set_permissions -p openstack guest ".*" ".*" ".*"
+
+#download rabbitmqadmin script
+https://raw.githubusercontent.com/rabbitmq/rabbitmq-management/rabbitmq_v3_5_3/bin/rabbitmqadmin
+
+#list exchanges
+sudo rabbitmqadmin -V openstack list exchanges
+
+#get queues' detail
+rabbitmqadmin -f long -d 3 list queues
+
+sudo rabbitmqctl list_vhosts
+sudo rabbitmqctl list_queues openstack
+sudo rabbitmqctl list_queues -p openstack
+sudo rabbitmqctl list_exchanges -p openstack
+sudo rabbitmqctl list_connections -p openstack
+
+
+********
+live backup qcow2 image
+********
+Assuming a base.qcow2 image is used now for a VM trustytest.
+
+1. create a snapshot - backed01.qcow2:
+
+virsh snapshot-create-as --domain trustytest sn1     --diskspec vda,file=backed01.qcow2 --disk-only --atomic
+
+2. pull data from base image, and backed01.qcow2 will be a standalone image after the operation is complete
+
+virsh blockpull --domain trustytest  --path /home/lchen/workspace/kvm/images/sn1.qcow2 --wait --verbose
+
+3. move base.qcow2 to anywhere for backup
+
+mv base.qcow2 /bak
+
+Do the same steps next time a backup needs to be made, except that the name of the image to back up is then backed01.qcow2.
+
+An alternative way is to use blockcommit.
+
+snapshot-create-as wires to transaction. Below is an example QMP using transaction to snapshot two blockdev atomically.
+{ "execute": "transaction", "arguments":
+  {'actions': [
+    { 'type': 'blockdev-snapshot-sync', 'data' :
+      { 'device': 'virtio0', 'snapshot-file': 'hd0-snap.qcow2' } },
+    { 'type': 'blockdev-snapshot-sync', 'data' :
+      { 'device': 'virtio1', 'snapshot-file': 'hd1-snap.qcow2' } } ] } }
+
+blockpull wires to block-stream which streams data from base image to snapshot.
+{"execute":"block-stream","arguments":{"device":"drive-virtio-disk0"},"id":"libvirt-10"}
+
+blockcommit wires to block-commit which commit data from snapshot to base image.
+
+***********************************
+build single kernel module
+***********************************
+cp /usr/src/kernels/3.10.0-514.16.1.el7.2.x86_64/Module.symvers .
+make -C ../../../  M=$(pwd) modules
+insmod xxx.ko
+
+********
+kernel crash dump
+********
+
+#instalation
+1) apt-get install linux-crashdump
+2) increase crashdump size:
+sudo vim /etc/default/grub.d/kexec-tools.cfg
+set crashkernel
+sudo update-grub
+3) reboot the machine
+4) sudo sed -i 's/USE_KDUMP=0/USE_KDUMP=1/g' /etc/default/kdump-tools
+5) kdump-config show # should return no errors
+6) echo 'c' | sudo tee /proc/sysrq-trigger
+
+# open crash dump with debug info for kernel image and modules
+crash --mod /home/ubuntu/salesforce/ddebs-3.13.0-58.97-precise/usr/lib/debug/lib/modules/3.13.0-58-generic/ /home/ubuntu/salesforce/ddebs-3.13.0-58.97-precise/usr/lib/debug/boot/vmlinux-3.13.0-58-generic vmcore-20151104170027
+# text address in memory dump to c source
+addr2line 0xffffffff8134e518 -e ../ddebs-3.13.0-58.97-precise/usr/lib/debug/boot/vmlinux-3.13.0-58-generic -f -i
+
+#switch to task with task struct at ...
+set ffff88102883e000
+#switch to task that was on cpu 43
+set -c 43
+
+#dump memory as 32bits/64bitx hex
+x/64xw 0xffff881028848048
+x/96xg 0xffff8801b996de00
+#dump memory as instructions
+x/96i 0xffff8801b996de00
+
+#dump task
+task ffff88102883e000 
+#show struct
+struct -o thread_info
+struct buffer_head ffff880826272138 -x
+#show symbol
+info  sym 0xffff880826272138
+#cast to thread_info and print
+p ((struct thread_info *)(ffff88102883e000)->stack)
+p ((struct thread_info *)0xffff881028848000)+1
+
+#show backtrace from a certain location
+bt -S ffff8801b996e000
+#show backtrace from just above the task_struct or thread_info
+bt -T
+foreach bt
+
+#check kernel mapping address
+ptov a67c9000
+
+kmem ffff8800a67c9000
+
+#show a init process's virual memory info
+vm 1
+#list all processes' virual memory areas
+foreach vm -p
+#search who has page a67c9000 
+foreach vm -p | grep a67c9000
+
+#display free memory structs and associated pages
+kmem -F
+#search whether page a67c9000 is free.
+kmem -F |grep a67c9000
+
+https://people.redhat.com/anderson/crash_whitepaper
+
+********
+kernel trace
+********
+#ftrace
+sudo trace-cmd list -f sys_poll
+sudo trace-cmd record -p function_graph -g SyS_poll
+sudo trace-cmd report
+
+#ftracing kill
+sudo trace-cmd record -p function_graph -g SyS_kill kill -9 2587878
+trace-cmd report > trace_kill.log
+
+#ftrace sysfs read
+trace-cmd record  --func-stack -l  sysfs_read_file  -p function cat /sys/fs/bcache/ae84dcfe-2bed-47f7-b6c2-a354e18662d8/bdev0/dirty_data
+trace-cmd report --profile
+
+#perf
+perf record -a -g
+perf report
+perf report --stdio
+perf report -i  abc.perf -k vmlinux
+perf top -g 
+
+perf probe -m bcache --line refill_dirty
+perf perf probe -m bcache -V refill_dirty:6
+perf  -m bcache --add refill_dirty:6 buf
+perf probe -m bcache  refill_dirty:6 "buf->last_scanned"
+perf record -e probe:refill_dirty_1  -e probe:refill_dirty  -aR
+perf probe -d probe:*
+perf script
+
+blktrace -d /dev/bcache0 -o -|blkparse -i - >> out.bcache
+
+stap -e 'probe process("/lib64/libc.so.6").function("*readdir*") {print_ubacktrace();}' -c ls -d /usr/bin/ls
+stap -v -e 'probe process("/usr/bin/qemu-system-x86_64").function("qcow2_co_writev")  {print_ubacktrace();}'
+stap -v -e 'probe process("/usr/bin/qemu-system-x86_64").function("aio_dispatch")  {print_ubacktrace();}'
+stap -v -e 'probe process("/usr/bin/qemu-system-x86_64").function("aio_dispatch")  {print_ubacktrace(); printf("Params:%s\n", $$parms);}'
+
+********
+vim
+********
+ctags --sort=foldcase -R . 
+cscope -R
+cscope -d
+#kernel make arch tags
+ARCH=x86 make tags
+ARCH=x86 make cscope
+
+********
+sts stack
+********
+<vtapia> liang: easier: use this ppa if you don't have it already ppa:niedbalski/serverstack-dns
+<vtapia> liang: and update serverstack-dns
+<vtapia> morning tinoco 
+<liang> vtapia, sure, thanks!
+<niedbalski> liang, if you install manually make sure to use the maintainer's version of the config.
+<liang> niedbalski, yep
+<vtapia> liang: once updated, make sure you add 'add_current_instances = true' to /etc/serverstack-dns/dns.conf
+<vtapia> liang: well, I didn't read niedbalski's message
+
+********
+iscsi
+********
+#login and create sdX block device with /etc/iscsi/nodes/iqn.2010-10.org.openstack\:volume-cf6ec0e1-eb55-43e8-a202-2baac362fb10/ in place
+iscsiadm -m node -T iqn.2010-10.org.openstack:volume-cf6ec0e1-eb55-43e8-a202-2baac362fb10 -p 10.5.6.247,3260 -l
+#logout
+iscsiadm -m node -T iqn.2010-10.org.openstack:volume-cf6ec0e1-eb55-43e8-a202-2baac362fb10 -p 10.5.6.247,3260 --logout
+
+#list session
+iscsiadm -m session -P3
+
+#remove session
+iscsiadm -m session -r SESSIONID -u
+
+#list targets
+tgt-admin -s
+
+#delete LU 0
+tgtadm --lld iscsi --op delete --mode logicalunit --tid=1 --lun=0
+
+#show active connections - target id(tid) 1
+tgtadm --lld iscsi --op show --mode conn --tid 1
+
+#delete connection - session id(sid) 1 connection id(cid) 0
+tgtadm --lld iscsi --op delete --mode conn --tid 1 --sid 1 --cid 0
+
+#delete target - tid 1
+tgtadm --lld iscsi --op delete --mode target --tid 1
+
+#multipath
+##make sure two NIC works 
+ping –I eth0 192.168.1.100
+ping –I eth1 192.168.1.100
+
+#if they are connected to the same lan, edit sysctl.conf
+net.ipv4.conf.eth0.rp_filter=2
+net.ipv4.conf.eth1.rp_filter=2
+sysctl -p
+
+#add two iscsi interfaces
+iscsiadm -m iface -I eth0 -o new
+iscsiadm -m iface -I eth1 -o new
+
+#bind them two the two NICs
+iscsiadm -m iface -I eth0 --op=update -n iface.net_ifacename -v eth0
+iscsiadm -m iface -I eth1 --op=update -n iface.net_ifacename -v eth1
+
+#discover iscsi targets
+iscsiadm -m discovery -t st -p 192.168.1.100
+
+#login
+iscsiadm -m node -T iqn.2001-05.com.equallogic:8-cb2b76-05afa6b6d-
+7f2f3e9dc2d52096-dm-ubuntu –-login
+
+#multipath with multi-interface
+#set node.session.nr_sessions to the number of sessions per iface.
+node.session.nr_sessions = 2
+#create ifaces that all using the same default link
+iscsiadm -m iface --op new -I c_iface1
+iscsiadm -m iface --op new -I c_iface2
+#login as usual
+iscsiadm -m node -L all
+
+********
+nfs
+********
+#/etc/export
+/export       10.230.56.0/24(rw,fsid=0,insecure,no_subtree_check,async)
+/export/users 10.230.56.0/24(rw,nohide,insecure,no_subtree_check,async)
+
+#mount with vers 4.1
+sudo mount -t nfs -o rw,nosuid,relatime,vers=4.1,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,port=0,timeo=600,retrans=2,sec=sys 10.230.56.11:/users nfs
+
+
+*********
+udev
+*********
+#show udev info
+udevadm info /dev/dm-0
+
+#monitor device environment variables
+udevadm monitor --environment --udev
+
+#monitor kernel uevent
+udevadm monitor -kp
+
+#monitor prcessed rules
+udevadm monitor -up
+
+#list attributes of device and its parent
+udevadm info --attribute-walk --name /dev/dm-0
+udevadm info -a -n
+
+#testing rules	(symlink will be created)
+udevadm test $(udevadm info -q path -n [device name]) 2>&1
+udevadm test --action=add /devices/pci0000:00/0000:00:09.0/virtio4/block/vdb
+
+#reload rules
+udevadm control --reload-rules
+
+#debug log
+sudo udevadm control --log-priority=debug
+
+
+**************
+local nat
+**************
+sudo iptables -t nat -A OUTPUT -p tcp -d 103.10.86.236 --dport 443 -j DNAT --to-destination 103.10.86.236:5443
+sudo iptables -t nat -A OUTPUT -p tcp -d 103.10.86.236 --dport 23 -j DNAT --to-destination 103.10.86.236:523
+
+**************
+ram fs/dish
+**************
+#mount tmpfs
+mount -o size=16G -t tmpfs none /mnt/tmpfs
+#create 1G /dev/ram0
+modprobe brd rd_nr=1 rd_size=1048576 max_part=0
+
