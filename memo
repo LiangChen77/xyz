@@ -1,4 +1,10 @@
 ************
+MISC
+************
+#dump all uninterruptable tasks
+echo w > /proc/sysrq-trigger
+
+************
 launch a kvm guest from command line
 ************
 
@@ -966,4 +972,6 @@ ram fs/dish
 mount -o size=16G -t tmpfs none /mnt/tmpfs
 #create 1G /dev/ram0
 modprobe brd rd_nr=1 rd_size=1048576 max_part=0
+# REMOVE ALL THE RAM DISKS
+rmmod brd
 
